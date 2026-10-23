@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+.venv-*/
+venv/
+env/
+
+# Packaging
+build/
+dist/
+*.egg-info/
+
+# IDE and OS files
+.DS_Store
+.idea/
+.vscode/
+
+# Runtime caches and generated documentation
+.cache/
+docs/_build/
+
+# Training outputs and model checkpoints
+runs/
+project/results/
+*.pt
+*.pth
+*.ckpt
+events.out.tfevents.*
+
+# Local secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
