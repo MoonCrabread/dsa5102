@@ -20,15 +20,26 @@ def record_gameplay(
     """Record each checkpoint with the same seed, cap, and grouped environment."""
     if episode_cap <= 0 or not checkpoints:
         raise ValueError("checkpoints and positive episode_cap are required")
-    output_dir.mkdir(parents=True, exist_ok=False)
-    outputs = []
+    recordings = []
     for checkpoint in checkpoints:
         agent, metadata = load_checkpoint_agent(checkpoint, torch.device("cpu"))
+        label = (
+            f"{metadata['algorithm']}_train_{int(metadata['seed'])}"
+            f"_step_{int(metadata['steps']):06d}_eval_{seed}"
+        )
+        destination = output_dir / f"{label}.gif"
+        if any(existing[2] == destination for existing in recordings):
+            raise ValueError(f"checkpoint filename collision: {destination}")
+        if destination.exists() or destination.with_suffix(".json").exists():
+            raise FileExistsError(destination)
+        recordings.append((agent, metadata, destination, checkpoint))
+    output_dir.mkdir(parents=True, exist_ok=False)
+    outputs = []
+    for agent, metadata, destination, checkpoint in recordings:
         env = make_project_env(
             seed=seed, render_mode="rgb_array", record_episode_statistics=False
         )
-        label = f"{metadata['algorithm']}_step_{int(metadata['steps']):06d}_seed_{seed}"
-        destination = output_dir / f"{label}.gif"
+        label = destination.stem
         try:
             observation, info = env.reset(seed=seed)
             frames = [np.asarray(env.render())]

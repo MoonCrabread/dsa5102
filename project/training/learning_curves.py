@@ -39,10 +39,21 @@ def plot_learning_curves(run_dir: Path) -> list[Path]:
         points = [
             (int(row["step"]), float(row[field])) for row in rows if row[field] != ""
         ]
-        if not points:
-            raise ValueError(f"no data for {field}")
         figure, axes = plt.subplots(figsize=(7, 4), layout="constrained")
-        axes.plot(*zip(*points), linewidth=1.8)
+        if points:
+            axes.plot(*zip(*points), linewidth=1.8)
+        elif field == "td_loss":
+            axes.text(
+                0.5,
+                0.5,
+                "No TD updates recorded",
+                ha="center",
+                va="center",
+                transform=axes.transAxes,
+            )
+        else:
+            plt.close(figure)
+            raise ValueError(f"no data for {field}")
         axes.set(xlabel="Environment steps", ylabel=ylabel, title=ylabel)
         axes.grid(alpha=0.25)
         path = figures / f"{filename}.png"
