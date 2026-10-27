@@ -149,6 +149,38 @@ def test_truncation_bootstraps_when_a_valid_successor_exists(algorithm: str):
     assert targets.item() == pytest.approx(expected)
 
 
+@pytest.mark.parametrize(
+    "algorithm, expected",
+    [
+        ("dqn", [17.0, 7.0, 16.0, 5.0]),
+        ("ddqn", [12.0, 7.0, 11.0, 5.0]),
+    ],
+)
+def test_td_targets_for_mixed_transition_batch(algorithm: str, expected: list[float]):
+    transitions = [
+        make_transition(reward=2.0),
+        make_transition(reward=7.0, terminated=True),
+        make_transition(reward=1.0, truncated=True),
+        make_transition(reward=5.0, next_mask=(False, False, False)),
+    ]
+
+    targets = compute_td_targets(
+        online=FeatureValueNetwork(0),
+        target=FeatureValueNetwork(1),
+        rewards=torch.tensor([item.reward for item in transitions]),
+        next_candidates=torch.as_tensor(
+            np.stack([item.next_candidates for item in transitions])
+        ),
+        next_masks=torch.as_tensor(np.stack([item.next_mask for item in transitions])),
+        terminated=torch.tensor([item.terminated for item in transitions]),
+        gamma=0.5,
+        algorithm=algorithm,
+    )
+
+    torch.testing.assert_close(targets, torch.tensor(expected), rtol=0.0, atol=0.0)
+    assert torch.isfinite(targets).all()
+
+
 def test_td_target_rejects_non_finite_bootstrap_values():
     transition = make_transition()
 
@@ -170,6 +202,9 @@ def test_optimize_batch_has_finite_loss_and_skips_disabled_imitation():
     target = TrainableValueNetwork()
     target.load_state_dict(online.state_dict())
     optimizer = torch.optim.Adam(online.parameters(), lr=1e-3)
+    parameters_before = [
+        parameter.detach().clone() for parameter in online.parameters()
+    ]
     terminal = replace(
         make_transition(reward=0.5, terminated=True),
         next_mask=np.zeros(3, dtype=bool),
@@ -191,6 +226,12 @@ def test_optimize_batch_has_finite_loss_and_skips_disabled_imitation():
     assert np.isfinite(result.total_loss)
     assert np.isfinite(result.grad_norm)
     assert result.imitation_loss is None
+    parameters_after = [parameter.detach() for parameter in online.parameters()]
+    assert all(torch.isfinite(parameter).all() for parameter in parameters_after)
+    assert any(
+        not torch.equal(before, after)
+        for before, after in zip(parameters_before, parameters_after, strict=True)
+    )
 
 
 def test_pure_dqn_defaults_disable_shaping_and_imitation(monkeypatch):
