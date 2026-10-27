@@ -74,6 +74,17 @@ class SeededEvaluationEnv:
         self.closed = True
 
 
+class TruncatingEvaluationEnv(SeededEvaluationEnv):
+    """End after two steps using Gymnasium's truncation signal."""
+
+    def __init__(self):
+        super().__init__(terminate_after=None)
+
+    def step(self, action: int):
+        observation, reward, _, _, info = super().step(action)
+        return observation, reward, False, self._step >= 2, info
+
+
 class IllegalAgent:
     """Always return an action that the fake environment marks illegal."""
 
@@ -218,6 +229,24 @@ def test_episode_cap_is_not_reported_as_normal_game_over():
             cap_reached=True,
         )
     ]
+
+
+def test_truncated_episode_is_not_reported_as_terminated_or_capped():
+    results = evaluate_agent(
+        RandomLegalAgent(),
+        model="random",
+        train_seed=None,
+        eval_seeds=[42],
+        episode_cap=10,
+        env_factory=lambda **kwargs: TruncatingEvaluationEnv(),
+    )
+
+    assert len(results) == 1
+    result = results[0]
+    assert result.truncated is True
+    assert result.terminated is False
+    assert result.cap_reached is False
+    assert result.episode_length == 2
 
 
 def test_write_results_preserves_episode_rows_and_groups_training_seeds(tmp_path):
