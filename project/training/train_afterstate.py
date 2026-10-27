@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import random
 import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
+from dataclasses import asdict
 
 import numpy as np
 import torch
@@ -18,6 +20,9 @@ from torch.utils.tensorboard import SummaryWriter
 
 from project.agents.afterstate import AfterstateNetwork, HeuristicAgent
 from project.environment.environment_factory import make_project_env
+from project.agents.afterstate import DeepAfterstateAgent
+from project.evaluation.evaluate import aggregate_results, evaluate_agent, EpisodeResult
+from project.training.learning_curves import plot_learning_curves
 
 
 @dataclass
@@ -81,6 +86,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--print-every", type=int, default=10)
     parser.add_argument("--output-dir", type=Path, default=Path("project/results"))
+    parser.add_argument("--checkpoint-every", type=int, default=10_000)
+    parser.add_argument("--eval-every", type=int, default=10_000)
+    parser.add_argument("--eval-episodes", type=int, default=10)
+    parser.add_argument("--eval-seed-start", type=int, default=10_000)
+    parser.add_argument("--eval-cap", type=int, default=2_000)
     return parser.parse_args()
 
 
@@ -120,6 +130,86 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--imitation-weight must be non-negative and finite")
     if args.print_every <= 0:
         raise ValueError("--print-every must be positive")
+    for name in ("checkpoint_every", "eval_every", "eval_episodes", "eval_cap"):
+        if getattr(args, name) <= 0:
+            raise ValueError(f"--{name.replace('_', '-')} must be positive")
+
+
+def due(step: int, interval: int, final_step: int) -> bool:
+    """Include both the configured interval and the final training step."""
+    return step % interval == 0 or step == final_step
+
+
+def save_checkpoint(
+    path: Path,
+    online: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    args: argparse.Namespace,
+    step: int,
+) -> None:
+    """Save Task B compatible weights plus reproducible training state."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    numpy_state: Any = np.random.get_state()
+    torch.save(
+        {
+            "algorithm": args.algorithm,
+            "hidden_size": 128,
+            "state_dict": online.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "steps": step,
+            "seed": args.seed,
+            "config": {
+                key: str(value) if isinstance(value, Path) else value
+                for key, value in vars(args).items()
+            },
+            "rng_state": {
+                "python": random.getstate(),
+                "numpy": (
+                    numpy_state[0],
+                    numpy_state[1].tolist(),
+                    numpy_state[2],
+                    numpy_state[3],
+                    numpy_state[4],
+                ),
+                "torch": torch.get_rng_state(),
+            },
+        },
+        path,
+    )
+
+
+def evaluate_snapshot(
+    online: nn.Module,
+    args: argparse.Namespace,
+    step: int,
+    writer: csv.DictWriter[str],
+    raw_writer: csv.DictWriter[str],
+) -> None:
+    """Evaluate current weights using Task B's fixed seed procedure."""
+    seeds = list(range(args.eval_seed_start, args.eval_seed_start + args.eval_episodes))
+    was_training = online.training
+    agent = DeepAfterstateAgent(online, next(online.parameters()).device)
+    try:
+        results = evaluate_agent(
+            agent,
+            model=args.algorithm,
+            train_seed=args.seed,
+            eval_seeds=seeds,
+            episode_cap=args.eval_cap,
+        )
+    finally:
+        online.train(was_training)
+    for result in results:
+        raw_writer.writerow({"step": step, **asdict(result)})
+    summary = aggregate_results(results)[0]
+    writer.writerow(
+        {
+            "step": step,
+            "eval_seeds": json.dumps(seeds),
+            "episode_cap": args.eval_cap,
+            **summary,
+        }
+    )
 
 
 def masked_values(
@@ -305,7 +395,12 @@ def main() -> None:
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     run_name = args.run_name or f"{args.algorithm}_{args.seed}_{int(time.time())}"
     run_dir = args.output_dir / run_name
-    run_dir.mkdir(parents=True, exist_ok=True)
+    run_dir.mkdir(parents=True, exist_ok=False)
+    config = {
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in vars(args).items()
+    }
+    (run_dir / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
 
     writer = SummaryWriter(log_dir=str(run_dir / "tensorboard"))
     csv_file = (run_dir / "episodes.csv").open("w", newline="", encoding="utf-8")
@@ -314,6 +409,25 @@ def main() -> None:
         fieldnames=("episode", "step", "reward", "lines", "length", "epsilon"),
     )
     csv_writer.writeheader()
+    diagnostics_file = (run_dir / "training_steps.csv").open(
+        "w", newline="", encoding="utf-8"
+    )
+    diagnostics = csv.DictWriter(
+        diagnostics_file, fieldnames=("step", "epsilon", "td_loss")
+    )
+    diagnostics.writeheader()
+    eval_file = (run_dir / "eval_history.csv").open("w", newline="", encoding="utf-8")
+    from project.evaluation.evaluate import AGGREGATE_FIELDS, PER_EPISODE_FIELDS
+
+    eval_writer: csv.DictWriter[str] = csv.DictWriter(
+        eval_file, fieldnames=("step", "eval_seeds", "episode_cap", *AGGREGATE_FIELDS)
+    )
+    eval_writer.writeheader()
+    raw_file = (run_dir / "eval_episodes.csv").open("w", newline="", encoding="utf-8")
+    raw_writer: csv.DictWriter[str] = csv.DictWriter(
+        raw_file, fieldnames=("step", *PER_EPISODE_FIELDS)
+    )
+    raw_writer.writeheader()
 
     env = make_project_env(seed=args.seed, record_episode_statistics=False)
     online = AfterstateNetwork().to(device)
@@ -321,6 +435,10 @@ def main() -> None:
     target.load_state_dict(online.state_dict())
     target.eval()
     optimizer = torch.optim.Adam(online.parameters(), lr=args.learning_rate)
+    save_checkpoint(
+        run_dir / "checkpoints" / "step_000000.pt", online, optimizer, args, 0
+    )
+    evaluate_snapshot(online, args, 0, eval_writer, raw_writer)
     replay: deque[Transition] = deque(maxlen=args.buffer_size)
 
     reset_observation, reset_info = env.reset(seed=args.seed)
@@ -441,9 +559,28 @@ def main() -> None:
                         result.imitation_loss,
                         step,
                     )
+                td_loss_value = result.td_loss
+            else:
+                td_loss_value = ""
+            diagnostics.writerow(
+                {"step": step, "epsilon": epsilon, "td_loss": td_loss_value}
+            )
 
             if step % args.target_update == 0:
                 target.load_state_dict(online.state_dict())
+
+            if due(step, args.checkpoint_every, args.steps):
+                save_checkpoint(
+                    run_dir / "checkpoints" / f"step_{step:06d}.pt",
+                    online,
+                    optimizer,
+                    args,
+                    step,
+                )
+            if due(step, args.eval_every, args.steps):
+                evaluate_snapshot(online, args, step, eval_writer, raw_writer)
+                eval_file.flush()
+                raw_file.flush()
 
             if episode_finished:
                 episode += 1
@@ -472,19 +609,21 @@ def main() -> None:
             else:
                 observation, info = next_observation, next_info
 
-        checkpoint = {
-            "algorithm": args.algorithm,
-            "hidden_size": 128,
-            "state_dict": online.state_dict(),
-            "steps": args.steps,
-            "seed": args.seed,
-        }
-        torch.save(checkpoint, run_dir / "model.pt")
+        save_checkpoint(
+            run_dir / "checkpoints" / "final.pt", online, optimizer, args, args.steps
+        )
+        save_checkpoint(run_dir / "model.pt", online, optimizer, args, args.steps)
+        diagnostics_file.flush()
+        eval_file.flush()
+        plot_learning_curves(run_dir)
         print(f"saved_model={run_dir / 'model.pt'}")
     finally:
         env.close()
         csv_file.close()
         writer.close()
+        diagnostics_file.close()
+        eval_file.close()
+        raw_file.close()
 
 
 if __name__ == "__main__":
